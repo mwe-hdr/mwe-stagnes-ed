@@ -1,0 +1,9 @@
+﻿*.log
+*.csv
+*.xlsx
+*.xlsm
+*.hyper
+*.twb
+*.twbx
+data/
+env/
