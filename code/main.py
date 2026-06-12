@@ -65,6 +65,30 @@ log("🚀 Script started")
 log(f"📁 Run directory: {run_dir}")
 
 # --------------------------------------------------
+# AUDIT CONFIG (OPTIONAL)
+# --------------------------------------------------
+
+AUDIT_DATE = "2024-10-15"   
+
+if AUDIT_DATE:
+    audit_date = pd.Timestamp(AUDIT_DATE)
+    audit_start = audit_date.normalize()
+    audit_end = audit_start + pd.Timedelta(days=1) - pd.Timedelta(minutes=1)
+    log(f"🔍 Audit mode enabled for {audit_date.date()}")
+
+# --------------------------------------------------
+# CAPACITY CONFIG
+# --------------------------------------------------
+
+ED_CAPACITY = 60   
+CAPACITY_THRESHOLD = 0.8
+
+CAPACITY_80 = int(ED_CAPACITY * CAPACITY_THRESHOLD)
+
+log(f"🏥 Capacity set to {ED_CAPACITY}")
+log(f"⚠️  80% threshold = {CAPACITY_80}")
+
+# --------------------------------------------------
 # DATABASE CONNECTION
 # --------------------------------------------------
 
@@ -228,6 +252,156 @@ stagnes_emergency_ts = ts[['acuity_name', 'interval', 'census']]
 stagnes_emergency_ts["census"] = stagnes_emergency_ts["census"].astype("Int64")
 
 # --------------------------------------------------
+# AUDIT OUTPUTS
+# --------------------------------------------------
+
+if AUDIT_DATE:
+
+    log("🧪 Building detailed audit outputs...")
+
+    # ---------------------------
+    # FILTER MINUTE-LEVEL SERIES
+    # ---------------------------
+    audit_ts = stagnes_emergency_ts[
+        (stagnes_emergency_ts["interval"] >= audit_start) &
+        (stagnes_emergency_ts["interval"] <= audit_end)
+    ].copy()
+
+    # ---------------------------
+    # ADD DELTA COLUMN BACK IN
+    # ---------------------------
+    # rebuild delta for audit transparency
+    audit_events = events.copy()
+
+    audit_events = audit_events[
+        (audit_events["interval"] >= audit_start) &
+        (audit_events["interval"] <= audit_end)
+    ]
+
+    audit_detail = audit_ts.merge(
+        audit_events,
+        on=["acuity_name", "interval"],
+        how="left"
+    )
+
+    audit_detail["delta"] = audit_detail["delta"].fillna(0)
+
+    # ---------------------------
+    # ADD ROLLUP BY MINUTE
+    # ---------------------------
+    audit_rollup = (
+        audit_detail.groupby("interval")["census"]
+        .sum()
+        .rename("total_census")
+        .reset_index()
+    )
+
+    audit_detail = audit_detail.merge(
+        audit_rollup,
+        on="interval",
+        how="left"
+    )
+
+    audit_detail["above_80"] = audit_detail["total_census"] >= CAPACITY_80
+
+    # ---------------------------
+    # SORT CLEANLY
+    # ---------------------------
+    audit_detail = audit_detail.sort_values(
+        ["interval", "acuity_name"]
+    )
+
+    # ---------------------------
+    # SUMMARY METRICS
+    # ---------------------------
+
+    summary = pd.DataFrame([
+        {"metric": "start_of_day", "value": audit_rollup["total_census"].iloc[0]},
+        {"metric": "max_census",  "value": audit_rollup["total_census"].max()},
+        {"metric": "end_of_day", "value": audit_rollup["total_census"].iloc[-1]},
+    ])
+
+    # ---------------------------
+    # ENCOUNTERS SUPPORTING DAY
+    # ---------------------------
+    audit_encounters = df[
+        (df["start"] <= audit_end) &
+        (df["end"] >= audit_start)
+    ].copy()
+
+    # Add duration overlap for clarity
+    audit_encounters["overlap_start"] = audit_encounters["start"].clip(lower=audit_start)
+    audit_encounters["overlap_end"]   = audit_encounters["end"].clip(upper=audit_end)
+
+    audit_encounters["overlap_minutes"] = (
+        (audit_encounters["overlap_end"] - audit_encounters["overlap_start"])
+        .dt.total_seconds() / 60
+    )
+
+    audit_encounters["encounter_key"] = (
+    audit_encounters["patient_id"].astype(str) + "_" +
+    audit_encounters["encounter_id"].astype(str)
+    )   
+
+    # ---------------------------
+    # AUDIT CAPACITY METRICS
+    # ---------------------------
+
+    audit_rollup["above_80"] = audit_rollup["total_census"] >= CAPACITY_80
+
+    audit_minutes_above_80 = audit_rollup["above_80"].sum()
+    audit_total_minutes = len(audit_rollup)
+
+    audit_pct_above_80 = (
+        audit_minutes_above_80 / audit_total_minutes
+        if audit_total_minutes > 0 else 0
+    )
+
+    audit_capacity_summary = pd.DataFrame([
+        {"metric": "capacity", "value": ED_CAPACITY},
+        {"metric": "threshold_80_pct", "value": CAPACITY_80},
+        {"metric": "minutes_above_80", "value": int(audit_minutes_above_80)},
+        {"metric": "total_minutes", "value": int(audit_total_minutes)},
+        {"metric": "pct_time_above_80", "value": audit_pct_above_80},
+    ])
+
+    audit_capacity_summary.to_csv(
+        output_dir / f"{YEAR_PREFIX}_capacity.audit.summary.csv",
+        index=False
+    )
+
+    # ---------------------------
+    # EXPORT FILES
+    # ---------------------------
+    audit_detail.to_csv(
+        output_dir / f"{YEAR_PREFIX}_census.audit.detail.csv",
+        index=False
+    )
+
+    summary.to_csv(
+        output_dir / f"{YEAR_PREFIX}_census.audit.summary.csv",
+        index=False
+    )
+
+    audit_encounters.to_csv(
+        output_dir / f"{YEAR_PREFIX}_census.audit.encounters.csv",
+        index=False
+    )
+
+    audit_sentence = (
+    f"On {audit_date.date()}, the emergency department operated at or above "
+    f"80% of capacity for {audit_minutes_above_80:,} minutes "
+    f"({audit_pct_above_80:.1%} of the day)."
+    )
+
+    audit_capacity_summary.loc[len(audit_capacity_summary)] = {
+        "metric": "narrative",
+        "value": audit_sentence
+    }
+
+    log("✅ Audit outputs written")
+
+# --------------------------------------------------
 # ROLLUP
 # --------------------------------------------------
 
@@ -236,6 +410,54 @@ rollup = (
     .groupby("interval", as_index=False)["census"]
     .sum()
 )
+
+# --------------------------------------------------
+# CAPACITY ANALYSIS (FULL FY)
+# --------------------------------------------------
+
+rollup["above_80"] = rollup["census"] >= CAPACITY_80
+
+minutes_above_80 = rollup["above_80"].sum()
+total_minutes = len(rollup)
+
+pct_above_80 = minutes_above_80 / total_minutes if total_minutes > 0 else 0
+
+capacity_summary = pd.DataFrame([
+    {"metric": "capacity", "value": ED_CAPACITY},
+    {"metric": "threshold_80_pct", "value": CAPACITY_80},
+    {"metric": "minutes_above_80", "value": int(minutes_above_80)},
+    {"metric": "total_minutes", "value": int(total_minutes)},
+    {"metric": "pct_time_above_80", "value": pct_above_80},
+])
+
+capacity_summary.to_csv(
+    output_dir / f"{YEAR_PREFIX}_capacity_summary.csv",
+    index=False
+)
+
+log(f"✅ Minutes above 80% capacity: {minutes_above_80:,}")
+log(f"✅ Percent time above 80%: {pct_above_80:.2%}")
+
+# --------------------------------------------------
+# CAPACITY NARRATIVE SENTENCE
+# --------------------------------------------------
+
+sentence = (
+    f"During the fiscal year, the emergency department operated at or above "
+    f"80% of its {ED_CAPACITY}-bed capacity ({CAPACITY_80} patients) for "
+    f"approximately {minutes_above_80:,.0f} minutes—representing "
+    f"{pct_above_80:.1%} of the total observed time."
+)
+
+# Add to summary table
+capacity_summary.loc[len(capacity_summary)] = {
+    "metric": "narrative",
+    "value": sentence
+}
+
+# Optional: also write to a standalone text file (nice for slides)
+with open(output_dir / f"{YEAR_PREFIX}_capacity_summary.txt", "w", encoding="utf-8") as f:
+    f.write(sentence)
 
 # --------------------------------------------------
 # EXPORT CSV
@@ -252,7 +474,7 @@ rollup.to_csv(
 log("📤 CSV outputs written")
 
 # --------------------------------------------------
-# HYPER WRITERS (UNCHANGED)
+# HYPER WRITERS 
 # --------------------------------------------------
 
 def write_census_hyper(df_out, path):
